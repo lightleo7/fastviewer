@@ -1,4 +1,4 @@
-# not working<
+import json
 import httpx
 from src.parsers.base import BaseVideoParser
 
@@ -10,90 +10,84 @@ class YouTubeParser(BaseVideoParser):
         return "YouTube"
 
     def __init__(self):
+        # Имитируем AJAX-клиент браузера со специальными заголовками
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/125.0.0.0 Safari/537.36"
             ),
+            "X-YouTube-Client-Name": "1",    # Сообщает серверу, что мы WEB-интерфейс
+            "X-YouTube-Client-Version": "2.20240501.01.00",
             "Accept": "*/*",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Origin": "https://www.youtube.com",
-            "Referer": "https://www.youtube.com/",
         }
 
     async def search(self, query: str) -> list[dict]:
         if not query.strip():
             return []
 
-        # Базовый endpoint десктопного поиска YouTube
-        url = "https://youtube.com"
+        formatted_query = query.strip().replace(" ", "+")
         
-        # Имитируем официальный веб-интерфейс (WEB)
-        payload = {
-            "context": {
-                "client": {
-                    "clientName": "WEB",
-                    "clientVersion": "2.20240501.01.00",
-                    "hl": "ru",
-                    "gl": "RU",
-                    "utcOffsetMinutes": 180
-                }
-            },
-            "query": query.strip()
-        }
+        url = f"https://youtube.com/results?search_query={formatted_query}&pbj=1"
 
         async with httpx.AsyncClient(headers=self.headers, follow_redirects=True, timeout=12.0) as client:
             try:
-                response = await client.post(url, json=payload)
+                response = await client.get(url)
                 if response.status_code != 200:
                     return []
 
-                data = response.json()
+                text_content = response.content.decode("utf-8", errors="replace")
                 
-                # Собираем абсолютно все рендереры, независимо от того, как глубоко их спрятал YouTube
-                renderers = list(self._find_keys_elements(data, ["videoRenderer", "playlistRenderer"]))
+                raw_data = json.loads(text_content)
+                
+                data = {}
+                if isinstance(raw_data, list):
+                    for part in raw_data:
+                        if "response" in part:
+                            data = part["response"]
+                            break
+                elif isinstance(raw_data, dict):
+                    data = raw_data.get("response", raw_data)
+
+                renderers = list(self._extract_renderers(data, ["videoRenderer", "playlistRenderer"]))
                 
                 videos = []
-                for key, item_data in renderers:
-                    
-                    # 1. ОБРАБОТКА ВИДЕО
+                for key, item in renderers:
                     if key == "videoRenderer":
-                        video_id = item_data.get("videoId")
+                        video_id = item.get("videoId")
                         if not video_id:
                             continue
                             
-                        thumbnails = item_data.get("thumbnail", {}).get("thumbnails", [])
+                        thumbnails = item.get("thumbnail", {}).get("thumbnails", [])
                         img_url = thumbnails[-1]["url"] if thumbnails else ""
                         
-                        title = self._parse_text_node(item_data.get("title"))
-                        author_name = self._parse_text_node(item_data.get("shortBylineText"))
+                        title = self._get_text(item.get("title"))
+                        author = self._get_text(item.get("shortBylineText"))
 
                         videos.append({
                             "id": video_id,
                             "title": title or "Без названия",
                             "url": f"https://www.youtube.com/watch?v={video_id}",
                             "image": img_url,
-                            "author": author_name or "Неизвестный автор",
+                            "author": author or "Неизвестный автор",
                             "type": "video",
                             "source": self.source_name,
                             "videos_count": None
                         })
 
-                    # 2. ОБРАБОТКА ПЛЕЙЛИСТОВ
                     elif key == "playlistRenderer":
-                        playlist_id = item_data.get("playlistId")
+                        playlist_id = item.get("playlistId")
                         if not playlist_id:
                             continue
                             
-                        thumbnails = item_data.get("thumbnails", [{}]).get("thumbnails", [])
+                        thumbnails = item.get("thumbnails", [{}]).get("thumbnails", [])
                         img_url = thumbnails[-1]["url"] if thumbnails else ""
                         
-                        title = self._parse_text_node(item_data.get("title"))
-                        author_name = self._parse_text_node(item_data.get("longBylineText"))
+                        title = self._get_text(item.get("title"))
+                        author = self._get_text(item.get("longBylineText"))
                         
-                        # Извлекаем число видео из строки (например, "12 видео")
-                        raw_count = item_data.get("videoCount", "0")
+                        raw_count = item.get("videoCount", "0")
                         digits = "".join(filter(str.isdigit, str(raw_count)))
                         videos_count = int(digits) if digits else 0
 
@@ -102,7 +96,7 @@ class YouTubeParser(BaseVideoParser):
                             "title": title or "Без названия",
                             "url": f"https://youtube.com{playlist_id}",
                             "image": img_url,
-                            "author": author_name or "Неизвестный автор",
+                            "author": author or "Неизвестный автор",
                             "type": "playlist",
                             "source": self.source_name,
                             "videos_count": videos_count
@@ -111,24 +105,24 @@ class YouTubeParser(BaseVideoParser):
                 return videos
 
             except Exception as e:
-                print(f"[YouTube Search Error]: {e}")
+                print(f"[YouTube Native Parser Error]: {e}")
                 return []
 
-    def _find_keys_elements(self, target_dict: dict | list, search_keys: list) -> list:
-        """Рекурсивно ищет любые нужные ключи в древовидном JSON."""
-        if isinstance(target_dict, dict):
-            for k, v in target_dict.items():
-                if k in search_keys:
+    def _extract_renderers(self, data: dict | list, keys: list) -> list:
+        """Рекурсивно сканирует дерево любой глубины, вытягивая видео и плейлисты."""
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if k in keys:
                     yield k, v
                 elif isinstance(v, (dict, list)):
-                    yield from self._find_keys_elements(v, search_keys)
-        elif isinstance(target_dict, list):
-            for item in target_dict:
+                    yield from self._extract_renderers(v, keys)
+        elif isinstance(data, list):
+            for item in data:
                 if isinstance(item, (dict, list)):
-                    yield from self._find_keys_elements(item, search_keys)
+                    yield from self._extract_renderers(item, keys)
 
-    def _parse_text_node(self, node: dict | None) -> str:
-        """Универсально вытаскивает текст как из simpleText, так и из массивов runs."""
+    def _get_text(self, node: dict | None) -> str:
+        """Универсальный безопасный разбор текстовых полей YouTube."""
         if not node or not isinstance(node, dict):
             return ""
         if "simpleText" in node:
